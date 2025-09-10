@@ -1,6 +1,7 @@
 #!/bin/bash
-# capture_dv.sh
-# Canon XL2 DV capture with ffmpeg on macOS
+# capture_dv_ffmpeg.sh
+# Canon XL2 DV capture using ffmpeg with per-segment timecode logging
+# Assumes tape is rewound. Requires manual PLAY on deck or dvcont.
 
 set -euo pipefail
 
@@ -10,59 +11,62 @@ if [ -z "$PROJECT" ]; then
   exit 1
 fi
 
-OUTDIR=~/Duke/"$PROJECT"
+OUTDIR="$HOME/Duke/$PROJECT"
 mkdir -p "$OUTDIR"
 
-DEVICE="3"         # FireWire DV usually enumerates as 0
-SEGMENT_TIME=3700  # ~1 hour
-STOP_TIMEOUT=15
+SEGMENT_TIME=3700   # ~1 hour segments
+LOGFILE="$OUTDIR/timecode.log"
+OUTPATTERN="$OUTDIR/${PROJECT}_%02d.dv"
 
-echo "=== DV Capture Utility ==="
+echo "=== DV Capture Utility (ffmpeg) ==="
 echo "Project: $PROJECT"
 echo "Output dir: $OUTDIR"
-echo "Using device index: $DEVICE"
+echo "Tape should be rewound. Press PLAY on XL2 before capture begins."
 
-# Choose capture options depending on build
-FFMPEG_OPTS="-f avfoundation -i \"$DEVICE\""
+read -p "Press Enter when tape is rolling..."
 
-if ffmpeg -h avfoundation 2>&1 | grep -q capture_rawdata; then
-  echo "Your ffmpeg supports -capture_rawdata"
-  FFMPEG_OPTS="-f avfoundation -capture_rawdata true -i \"$DEVICE\""
-else
-  echo "⚠️ Your ffmpeg does not support -capture_rawdata; may lose audio"
-fi
+# -------------------------
+# Start live preview
+# -------------------------
+echo "Starting live preview..."
+ffplay -f iec61883 -i auto -window_title "XL2 Preview" -vf "scale=640:480" -an &
+PREVIEW_PID=$!
 
-# Run 10-second test
-TESTFILE="$OUTDIR/test.dv"
-echo "Running 10s test capture..."
-eval ffmpeg -y $FFMPEG_OPTS -t 10 -c copy "$TESTFILE"
+echo "=== Capture started: $(date) ===" > "$LOGFILE"
 
-echo "Probing test file..."
-if ffprobe -hide_banner "$TESTFILE" 2>&1 | grep -q "Audio: pcm_s16le"; then
-  echo "✅ Audio detected in test capture"
-else
-  echo "⚠️ No audio stream detected — check your ffmpeg build"
-  echo "   Consider rebuilding ffmpeg with --enable-indev=avfoundation and raw capture support"
-fi
-
-read -p "Continue with full tape capture? (y/n) " cont
-if [[ "$cont" != "y" && "$cont" != "Y" ]]; then
-  echo "Aborting."
-  exit 0
-fi
-
-# Full tape capture
-DATE=$(date +"%Y%m%d_%H%M%S")
-OUTFILE="$OUTDIR/${PROJECT}_%02d.dv"
-
-eval ffmpeg $FFMPEG_OPTS \
+# -------------------------
+# Run capture
+# -------------------------
+ffmpeg -hide_banner \
+  -f iec61883 -i auto \
   -c copy \
   -f segment \
+  -err_detect ignore_err \
   -segment_time $SEGMENT_TIME \
   -reset_timestamps 1 \
-  -segment_format dv \
-  "$OUTFILE" \
-  -nostdin \
-  -xerror \
-  -timeout $((STOP_TIMEOUT*1000000)) \
-  -rw_timeout $((STOP_TIMEOUT*1000000))
+  "$OUTPATTERN"
+
+# -------------------------
+# After capture: extract timecodes
+# -------------------------
+echo >> "$LOGFILE"
+for f in "$OUTDIR"/*.dv; do
+  if [ -f "$f" ]; then
+    TC=$(ffprobe -v error -select_streams v:0 -show_entries frame=timecode \
+         -of default=nw=1:nk=1 -read_intervals %+#1 "$f" 2>/dev/null | head -n1)
+    if [ -n "$TC" ]; then
+      echo "$(basename "$f") start timecode: $TC" | tee -a "$LOGFILE"
+    else
+      echo "$(basename "$f") start timecode: (not found)" | tee -a "$LOGFILE"
+    fi
+  fi
+done
+
+# -------------------------
+# Cleanup
+# -------------------------
+kill $PREVIEW_PID >/dev/null 2>&1 || true
+echo "=== Capture ended: $(date) ===" >> "$LOGFILE"
+
+echo "=== Capture complete ==="
+cat "$LOGFILE"
